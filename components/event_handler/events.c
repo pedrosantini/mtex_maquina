@@ -25,4 +25,7 @@ Event fe = {CONTROLLABLE, 20, SUP_DEBUG_STR("fe"), NULL};
 Event botao = {UNCONTROLLABLE, 21, SUP_DEBUG_STR("botao"), NULL};
 Event Smet = {UNCONTROLLABLE, 22, SUP_DEBUG_STR("Smet"), NULL};
 
-Event *controllable_event_list[CONTROLLABLE_EVENTS_COUNT] = {&a1,&a2,&a0,&a3,&a4,&iBp,&iBm,&iBg,&ie,&fe};
+// ie e fe removidos da cascata automatica: se ficassem aqui, o estado
+// "armado e vazio" (contador 0) geraria o livelock ie->fe->ie->fe (recursao
+// infinita). Sao disparados manualmente via trigger_event() no main.c.
+Event *controllable_event_list[CONTROLLABLE_EVENTS_COUNT] = {&a1,&a2,&a0,&a3,&a4,&iBp,&iBm,&iBg};

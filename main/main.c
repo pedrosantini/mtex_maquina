@@ -28,6 +28,7 @@
 
 #define DEBOUNCE_STABLE_READS 8  // leituras consecutivas iguais para validar (~80ms a 10ms/loop)
 #define PULSE_DURATION_MS 300    // duracao do pulso de solenoide/sinaleira
+#define ESTEIRA_ON_DURATION_MS 3000 // tempo que a esteira roda apos ser acionada (trajeto da peca ate o braco)
 
 void default_action(const Event *event) {
   SUP_DEBUG_PRINT("Action for %s event '%s'\n",
@@ -42,14 +43,18 @@ typedef struct {
   gpio_num_t pin;
   bool active;
   TickType_t start_tick;
+  uint32_t duration_ms; // duracao propria de cada saida temporizada
 } PulseOutput;
 
-enum { PULSE_BRACO_P, PULSE_BRACO_M, PULSE_BRACO_G, PULSE_COUNT };
+// A esteira e tratada como uma saida temporizada (como os solenoides), porem
+// com duracao propria (ESTEIRA_ON_DURATION_MS) bem maior que o pulso do braco.
+enum { PULSE_BRACO_P, PULSE_BRACO_M, PULSE_BRACO_G, PULSE_ESTEIRA, PULSE_COUNT };
 
 static PulseOutput pulse_outputs[PULSE_COUNT] = {
-  [PULSE_BRACO_P] = {.pin = SOLENOIDE_BRACO_P_PIN},
-  [PULSE_BRACO_M] = {.pin = SOLENOIDE_BRACO_M_PIN},
-  [PULSE_BRACO_G] = {.pin = SOLENOIDE_BRACO_G_PIN},
+  [PULSE_BRACO_P] = {.pin = SOLENOIDE_BRACO_P_PIN, .duration_ms = PULSE_DURATION_MS},
+  [PULSE_BRACO_M] = {.pin = SOLENOIDE_BRACO_M_PIN, .duration_ms = PULSE_DURATION_MS},
+  [PULSE_BRACO_G] = {.pin = SOLENOIDE_BRACO_G_PIN, .duration_ms = PULSE_DURATION_MS},
+  [PULSE_ESTEIRA] = {.pin = MOTOR_ESTEIRA_PIN,     .duration_ms = ESTEIRA_ON_DURATION_MS},
 };
 
 void start_pulse(PulseOutput *pulse) {
@@ -62,9 +67,15 @@ void update_pulses(void) {
   for (int i = 0; i < PULSE_COUNT; i++) {
     PulseOutput *pulse = &pulse_outputs[i];
     if (pulse->active &&
-        (xTaskGetTickCount() - pulse->start_tick) >= pdMS_TO_TICKS(PULSE_DURATION_MS)) {
+        (xTaskGetTickCount() - pulse->start_tick) >= pdMS_TO_TICKS(pulse->duration_ms)) {
       gpio_set_level(pulse->pin, 0);
       pulse->active = false;
+      if (i == PULSE_ESTEIRA) {
+        // Fim do tempo da esteira: sinaliza 'fe' ao supervisor. A cascata de
+        // eventos controlaveis dispara entao o braco (iBp/iBm/iBg) correspondente
+        // ao tamanho que foi contado quando a peca entrou.
+        trigger_event(&fe);
+      }
     }
   }
 }
@@ -86,12 +97,16 @@ void action_iBg(const Event *event) {
 
 void action_ie(const Event *event) {
   default_action(event);
-  gpio_set_level(MOTOR_ESTEIRA_PIN, 1); // liga o motor da esteira
+  // Liga a esteira por tempo determinado; update_pulses() a desliga sozinha
+  // apos ESTEIRA_ON_DURATION_MS (nunca fica ligada indefinidamente).
+  start_pulse(&pulse_outputs[PULSE_ESTEIRA]);
 }
 
 void action_fe(const Event *event) {
   default_action(event);
-  gpio_set_level(MOTOR_ESTEIRA_PIN, 1); // desliga o motor da esteira
+  // Garante a esteira desligada. O desligamento normal ja e feito pelo
+  // temporizador em update_pulses(); aqui e redundante/seguranca.
+  gpio_set_level(MOTOR_ESTEIRA_PIN, 0);
 }
 
 // --- Entradas com debounce: sensores de classificacao e fins de curso ---
@@ -102,14 +117,15 @@ typedef struct {
   int last_level;
   int candidate_level;
   int stable_count;
+  bool start_belt; // sensores de classificacao ligam a esteira ao detectar a peca
 } DebouncedInput;
 
 enum { IN_SP, IN_SM, IN_SG, IN_SMET, IN_FBP, IN_FBM, IN_FBG, IN_BOTAO, IN_COUNT };
 
 static DebouncedInput debounced_inputs[IN_COUNT] = {
-  [IN_SP]   = {.pin = SENSOR_PEQUENO_PIN,    .event = &sp},
-  [IN_SM]   = {.pin = SENSOR_MEDIO_PIN,      .event = &sm},
-  [IN_SG]   = {.pin = SENSOR_GRANDE_PIN,     .event = &sg},
+  [IN_SP]   = {.pin = SENSOR_PEQUENO_PIN,    .event = &sp,   .start_belt = true},
+  [IN_SM]   = {.pin = SENSOR_MEDIO_PIN,      .event = &sm,   .start_belt = true},
+  [IN_SG]   = {.pin = SENSOR_GRANDE_PIN,     .event = &sg,   .start_belt = true},
   [IN_SMET] = {.pin = SENSOR_METAL_PIN,      .event = &Smet},
   [IN_FBP]  = {.pin = FIM_CURSO_BRACO_P_PIN, .event = &fBp},
   [IN_FBM]  = {.pin = FIM_CURSO_BRACO_M_PIN, .event = &fBm},
@@ -135,6 +151,12 @@ void poll_input(DebouncedInput *input) {
     input->last_level = input->candidate_level;
     if (input->candidate_level == 1) {
       trigger_event(input->event);
+      if (input->start_belt) {
+        // Peca detectada e ja contada pelo supervisor: liga a esteira.
+        // trigger_event so tera efeito se 'ie' estiver habilitado (maquina
+        // armada e sem ciclo em andamento); caso contrario e ignorado.
+        trigger_event(&ie);
+      }
     }
   }
 }

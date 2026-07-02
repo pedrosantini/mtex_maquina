@@ -4,7 +4,9 @@
 #include "supervisor.h"
 #include <stdlib.h>
 
-#define CONTROLLABLE_EVENTS_COUNT 10
+// ie/fe sao disparados explicitamente pela camada de acao (temporizador da
+// esteira), por isso ficam FORA da cascata automatica de eventos controlaveis.
+#define CONTROLLABLE_EVENTS_COUNT 8
 
 // create events
 extern Event a1;
