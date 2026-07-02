@@ -91,7 +91,7 @@ void action_ie(const Event *event) {
 
 void action_fe(const Event *event) {
   default_action(event);
-  gpio_set_level(MOTOR_ESTEIRA_PIN, 1); // desliga o motor da esteira
+  gpio_set_level(MOTOR_ESTEIRA_PIN, 0); // desliga o motor da esteira
 }
 
 // --- Entradas com debounce: sensores de classificacao e fins de curso ---
