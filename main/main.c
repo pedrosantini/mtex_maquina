@@ -27,8 +27,19 @@
 #define MOTOR_ESTEIRA_PIN      GPIO_NUM_22 // ie/fe - rele do motor da esteira
 
 #define DEBOUNCE_STABLE_READS 8  // leituras consecutivas iguais para validar (~80ms a 10ms/loop)
-#define PULSE_DURATION_MS 300    // duracao do pulso de solenoide/sinaleira
-#define ESTEIRA_ON_DURATION_MS 3000 // tempo que a esteira roda apos ser acionada (trajeto da peca ate o braco)
+// Duracao do pulso de cada braco (solenoide). Cada braco pode ter um tempo
+// proprio: o medio/grande costumam precisar de mais tempo que o pequeno.
+#define PULSE_BRACO_P_MS 300     // braco pequeno
+#define PULSE_BRACO_M_MS 500     // braco medio (mais tempo que o pequeno)
+#define PULSE_BRACO_G_MS 700     // braco grande
+// Tempo que a esteira gira ate a peca chegar ao braco correspondente. Cada
+// tamanho tem seu proprio tempo, pois cada braco fica numa posicao diferente:
+//   so sp          -> pequeno
+//   sp + sm        -> medio
+//   sp + sm + sg   -> grande
+#define ESTEIRA_P_MS 3000 // pequeno (braco mais proximo)
+#define ESTEIRA_M_MS 4000 // medio
+#define ESTEIRA_G_MS 5000 // grande (braco mais distante)
 
 void default_action(const Event *event) {
   SUP_DEBUG_PRINT("Action for %s event '%s'\n",
@@ -47,14 +58,16 @@ typedef struct {
 } PulseOutput;
 
 // A esteira e tratada como uma saida temporizada (como os solenoides), porem
-// com duracao propria (ESTEIRA_ON_DURATION_MS) bem maior que o pulso do braco.
+// com duracao propria (ESTEIRA_P/M/G_MS) bem maior que o pulso do braco.
 enum { PULSE_BRACO_P, PULSE_BRACO_M, PULSE_BRACO_G, PULSE_ESTEIRA, PULSE_COUNT };
 
 static PulseOutput pulse_outputs[PULSE_COUNT] = {
-  [PULSE_BRACO_P] = {.pin = SOLENOIDE_BRACO_P_PIN, .duration_ms = PULSE_DURATION_MS},
-  [PULSE_BRACO_M] = {.pin = SOLENOIDE_BRACO_M_PIN, .duration_ms = PULSE_DURATION_MS},
-  [PULSE_BRACO_G] = {.pin = SOLENOIDE_BRACO_G_PIN, .duration_ms = PULSE_DURATION_MS},
-  [PULSE_ESTEIRA] = {.pin = MOTOR_ESTEIRA_PIN,     .duration_ms = ESTEIRA_ON_DURATION_MS},
+  [PULSE_BRACO_P] = {.pin = SOLENOIDE_BRACO_P_PIN, .duration_ms = PULSE_BRACO_P_MS},
+  [PULSE_BRACO_M] = {.pin = SOLENOIDE_BRACO_M_PIN, .duration_ms = PULSE_BRACO_M_MS},
+  [PULSE_BRACO_G] = {.pin = SOLENOIDE_BRACO_G_PIN, .duration_ms = PULSE_BRACO_G_MS},
+  // duration_ms da esteira e definido em tempo de execucao conforme o tamanho
+  // classificado (ESTEIRA_P/M/G_MS); aqui fica o valor do menor como padrao.
+  [PULSE_ESTEIRA] = {.pin = MOTOR_ESTEIRA_PIN,     .duration_ms = ESTEIRA_P_MS},
 };
 
 void start_pulse(PulseOutput *pulse) {
@@ -98,7 +111,8 @@ void action_iBg(const Event *event) {
 void action_ie(const Event *event) {
   default_action(event);
   // Liga a esteira por tempo determinado; update_pulses() a desliga sozinha
-  // apos ESTEIRA_ON_DURATION_MS (nunca fica ligada indefinidamente).
+  // apos o tempo do tamanho classificado (nunca fica ligada indefinidamente).
+  // O duration_ms ja foi ajustado em poll_input antes deste trigger.
   start_pulse(&pulse_outputs[PULSE_ESTEIRA]);
 }
 
@@ -117,15 +131,15 @@ typedef struct {
   int last_level;
   int candidate_level;
   int stable_count;
-  bool start_belt; // sensores de classificacao ligam a esteira ao detectar a peca
+  uint32_t belt_ms; // >0 nos sensores de classificacao: tempo da esteira p/ aquele tamanho
 } DebouncedInput;
 
 enum { IN_SP, IN_SM, IN_SG, IN_SMET, IN_FBP, IN_FBM, IN_FBG, IN_BOTAO, IN_COUNT };
 
 static DebouncedInput debounced_inputs[IN_COUNT] = {
-  [IN_SP]   = {.pin = SENSOR_PEQUENO_PIN,    .event = &sp,   .start_belt = true},
-  [IN_SM]   = {.pin = SENSOR_MEDIO_PIN,      .event = &sm,   .start_belt = true},
-  [IN_SG]   = {.pin = SENSOR_GRANDE_PIN,     .event = &sg,   .start_belt = true},
+  [IN_SP]   = {.pin = SENSOR_PEQUENO_PIN,    .event = &sp,   .belt_ms = ESTEIRA_P_MS},
+  [IN_SM]   = {.pin = SENSOR_MEDIO_PIN,      .event = &sm,   .belt_ms = ESTEIRA_M_MS},
+  [IN_SG]   = {.pin = SENSOR_GRANDE_PIN,     .event = &sg,   .belt_ms = ESTEIRA_G_MS},
   [IN_SMET] = {.pin = SENSOR_METAL_PIN,      .event = &Smet},
   [IN_FBP]  = {.pin = FIM_CURSO_BRACO_P_PIN, .event = &fBp},
   [IN_FBM]  = {.pin = FIM_CURSO_BRACO_M_PIN, .event = &fBm},
@@ -151,11 +165,22 @@ void poll_input(DebouncedInput *input) {
     input->last_level = input->candidate_level;
     if (input->candidate_level == 1) {
       trigger_event(input->event);
-      if (input->start_belt) {
-        // Peca detectada e ja contada pelo supervisor: liga a esteira.
-        // trigger_event so tera efeito se 'ie' estiver habilitado (maquina
-        // armada e sem ciclo em andamento); caso contrario e ignorado.
-        trigger_event(&ie);
+      if (input->belt_ms > 0) {
+        // Sensor de classificacao. Define o tempo que a esteira deve girar ate
+        // o braco correspondente ao tamanho.
+        PulseOutput *belt = &pulse_outputs[PULSE_ESTEIRA];
+        if (!belt->active) {
+          // Inicio de um novo ciclo: primeiro feixe rompido (normalmente sp)
+          // liga a esteira com o tempo daquele tamanho. trigger_event(&ie) so
+          // tem efeito se 'ie' estiver habilitado (maquina armada, sem ciclo em
+          // andamento); caso contrario e ignorado.
+          belt->duration_ms = input->belt_ms;
+          trigger_event(&ie);
+        } else if (input->belt_ms > belt->duration_ms) {
+          // Peca maior do que o detectado ate agora (ex.: sm/sg logo apos sp):
+          // estende o tempo da esteira ate o braco correto, sem reiniciar o ciclo.
+          belt->duration_ms = input->belt_ms;
+        }
       }
     }
   }
