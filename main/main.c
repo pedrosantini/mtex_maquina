@@ -83,11 +83,20 @@ void update_pulses(void) {
         (xTaskGetTickCount() - pulse->start_tick) >= pdMS_TO_TICKS(pulse->duration_ms)) {
       gpio_set_level(pulse->pin, 0);
       pulse->active = false;
-      if (i == PULSE_ESTEIRA) {
-        // Fim do tempo da esteira: sinaliza 'fe' ao supervisor. A cascata de
-        // eventos controlaveis dispara entao o braco (iBp/iBm/iBg) correspondente
-        // ao tamanho que foi contado quando a peca entrou.
-        trigger_event(&fe);
+      switch (i) {
+        case PULSE_ESTEIRA:
+          // Fim do tempo da esteira: sinaliza 'fe' ao supervisor. A cascata de
+          // eventos controlaveis dispara entao o braco (iBp/iBm/iBg) correspondente
+          // ao tamanho que foi contado quando a peca entrou.
+          trigger_event(&fe);
+          break;
+        // Fim do pulso do braco: o solenoide foi desenergizado e a mola retorna
+        // o cilindro ao repouso. Sinaliza o fim de curso (fBp/fBm/fBg) ao
+        // supervisor para que ele recicle e habilite 'ie' para a proxima peca.
+        // Isso torna o reciclo deterministico e independente do sensor fisico.
+        case PULSE_BRACO_P: trigger_event(&fBp); break;
+        case PULSE_BRACO_M: trigger_event(&fBm); break;
+        case PULSE_BRACO_G: trigger_event(&fBg); break;
       }
     }
   }
