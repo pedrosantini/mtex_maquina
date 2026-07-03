@@ -37,8 +37,8 @@
 //   so sp          -> pequeno
 //   sp + sm        -> medio
 //   sp + sm + sg   -> grande
-#define ESTEIRA_P_MS 3000 // pequeno (braco mais proximo)
-#define ESTEIRA_M_MS 4000 // medio
+#define ESTEIRA_P_MS 2500 // pequeno (braco mais proximo)
+#define ESTEIRA_M_MS 4850 // medio
 #define ESTEIRA_G_MS 5000 // grande (braco mais distante)
 
 void default_action(const Event *event) {
