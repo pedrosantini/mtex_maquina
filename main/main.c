@@ -38,18 +38,62 @@
 
 // Passo da esteira: anda por ESTEIRA_PASSO e em seguida fica parada por
 // ESTEIRA_PASSO, repetindo. Cada parada equivale a "uma casa" do vetor de memoria.
-#define ESTEIRA_PASSO 2000
+// Com o passo reduzido pela metade, cada casa cobre metade da distancia, entao
+// cada braco fica a DUAS casas do anterior (uma casa intermediaria no meio).
+#define ESTEIRA_PASSO 1000
+
+// Imprime o vetor da esteira a cada parada na serial. Comente para desligar.
+#define DEBUG_ESTEIRA 1
 
 // --- Memoria da esteira (registrador de deslocamento) ---
-// Cada posicao guarda o tipo da peca naquela estacao fisica:
-//   esteira_mem[0] = posicao 1 (sensor / entrada)
-//   esteira_mem[1] = posicao 2 (braco pequeno)
-//   esteira_mem[2] = posicao 3 (braco medio)
-//   esteira_mem[3] = posicao 4 (braco grande)
+// Cada posicao guarda o tipo da peca naquela casa fisica. Como cada braco fica a
+// duas casas do anterior, ha uma casa intermediaria entre as estacoes uteis:
+//   esteira_mem[0] = sensor pequeno  - TODA peca para exatamente aqui
+//   esteira_mem[1] = (intermediaria)
+//   esteira_mem[2] = braco pequeno
+//   esteira_mem[3] = (intermediaria)
+//   esteira_mem[4] = braco medio
+//   esteira_mem[5] = (intermediaria)
+//   esteira_mem[6] = braco grande
 // A cada passo da esteira o vetor desloca uma casa para frente.
 typedef enum { VAZIO = 0, PEQUENA = 1, MEDIA = 2, GRANDE = 3 } TipoPeca;
-#define NUM_POSICOES 4
+#define POS_SENSOR   0
+#define POS_BRACO_P  2
+#define POS_BRACO_M  4
+#define POS_BRACO_G  6
+#define NUM_POSICOES 7
 static TipoPeca esteira_mem[NUM_POSICOES] = {VAZIO};
+
+static uint32_t passo_num = 0; // conta as paradas desde o inicio
+
+// Latch do sensor medio. O sensor medio fica ANTES do sensor pequeno e FORA de um
+// ponto de parada, entao a peca so passa por ele enquanto a esteira anda (pulso
+// rapido). A interrupcao marca aqui que a peca que esta chegando ao sensor pequeno
+// e media. A classificacao final acontece na parada (classifica_no_sensor), e o
+// latch e consumido/limpo la.
+static volatile bool medio_visto = false;
+
+// Simbolo de cada tipo de peca para impressao.
+static char simbolo_peca(TipoPeca t) {
+  switch (t) {
+    case PEQUENA: return 'P';
+    case MEDIA:   return 'M';
+    case GRANDE:  return 'G';
+    default:      return '.';
+  }
+}
+
+// Imprime na serial o estado atual do vetor da esteira.
+//   idx0=sensor  idx2=braco P  idx4=braco M  idx6=braco G  (impares=intermediarias)
+void print_belt(void) {
+#ifdef DEBUG_ESTEIRA
+  printf("Passo %3u | esteira: [ ", (unsigned) passo_num);
+  for (int i = 0; i < NUM_POSICOES; i++) {
+    printf("%c%s", simbolo_peca(esteira_mem[i]), (i < NUM_POSICOES - 1) ? " | " : " ");
+  }
+  printf("]  (idx0=sensor, idx2=P, idx4=M, idx6=G)\n");
+#endif
+}
 
 void default_action(const Event *event) {
   SUP_DEBUG_PRINT("Action for %s event '%s'\n",
@@ -112,12 +156,12 @@ typedef struct {
   int stable_count;
 } DebouncedInput;
 
-enum { IN_SP, IN_SM, IN_SG, IN_SMET, IN_FBP, IN_FBM, IN_FBG, IN_BOTAO, IN_COUNT };
+// Os sensores de classificacao (pequeno/medio/grande) nao entram aqui: o medio e
+// tratado por interrupcao (sensor_medio_isr) e o pequeno e lido por nivel na
+// parada (classifica_no_sensor).
+enum { IN_SMET, IN_FBP, IN_FBM, IN_FBG, IN_BOTAO, IN_COUNT };
 
 static DebouncedInput debounced_inputs[IN_COUNT] = {
-  [IN_SP]   = {.pin = SENSOR_PEQUENO_PIN},
-  [IN_SM]   = {.pin = SENSOR_MEDIO_PIN},
-  [IN_SG]   = {.pin = SENSOR_GRANDE_PIN},
   [IN_SMET] = {.pin = SENSOR_METAL_PIN},
   [IN_FBP]  = {.pin = FIM_CURSO_BRACO_P_PIN},
   [IN_FBM]  = {.pin = FIM_CURSO_BRACO_M_PIN},
@@ -125,45 +169,71 @@ static DebouncedInput debounced_inputs[IN_COUNT] = {
   [IN_BOTAO] = {.pin = BOTAO_PIN,            .event = &botao},
 };
 
-// Classifica a peca que esta na posicao 1 (sensor) pelos feixes rompidos.
-// Robusto tanto se a peca grande rompe os 3 feixes (cumulativo) quanto se cada
-// tamanho rompe apenas o seu: prioriza o maior feixe rompido.
-static TipoPeca classifica_sensor(void) {
-  if (debounced_inputs[IN_SG].last_level == 1) return GRANDE;
-  if (debounced_inputs[IN_SM].last_level == 1) return MEDIA;
-  if (debounced_inputs[IN_SP].last_level == 1) return PEQUENA;
-  return VAZIO;
+// Interrupcao do sensor MEDIO (borda de subida). O sensor medio fica antes do
+// sensor pequeno e FORA de um ponto de parada: a peca so passa por ele enquanto a
+// esteira anda (pulso rapido), por isso precisa de interrupcao. Aqui apenas
+// marca-se que a peca que esta chegando ao sensor pequeno e media; a decisao final
+// (media x pequena x vazio) acontece na parada, em classifica_no_sensor().
+// O sensor grande esta quebrado e e ignorado.
+static void IRAM_ATTR sensor_medio_isr(void *arg) {
+  (void) arg;
+  // confirma nivel alto: filtra glitches e a interrupcao espuria de boot
+  if (gpio_get_level(SENSOR_MEDIO_PIN) == 1) {
+    medio_visto = true;
+  }
+}
+
+// Le a peca que esta parada EXATAMENTE sobre o sensor pequeno (posicao 1 do
+// vetor). Toda peca para nesse ponto antes de seguir para o braco pequeno. O tipo
+// vem do latch do sensor medio: se o feixe medio foi rompido enquanto a peca se
+// aproximava -> media; caso contrario -> pequena. Sem peca sobre o sensor -> vazio.
+// Le o NIVEL (presenca), nao bordas: assim o pulso longo da media nao vira uma
+// pequena fantasma.
+static TipoPeca classifica_no_sensor(void) {
+  if (gpio_get_level(SENSOR_PEQUENO_PIN) != 1) {
+    return VAZIO;
+  }
+  return medio_visto ? MEDIA : PEQUENA;
 }
 
 // Chamada uma vez a cada parada (borda andar->parar): desloca o registrador uma
 // casa e aciona os bracos das pecas que chegaram a sua estacao de descarte.
 static void on_belt_stop(void) {
-  // desloca uma posicao para frente (a peca do sensor vai para o braco P, etc.)
+  // desloca uma posicao para frente (a peca do braco P vai para o braco M, etc.)
   for (int i = NUM_POSICOES - 1; i > 0; i--) {
     esteira_mem[i] = esteira_mem[i - 1];
   }
-  esteira_mem[0] = VAZIO;
+  // A peca que esta parada sobre o sensor pequeno entra na posicao do sensor
+  // (index 0). Como cada braco fica a duas casas de distancia, ela leva DOIS
+  // passos ate chegar no braco pequeno, quatro ate o medio e seis ate o grande.
+  esteira_mem[POS_SENSOR] = classifica_no_sensor();
+  medio_visto = false; // latch do sensor medio consumido; pronto para a proxima peca
+
+  // Mostra o vetor deste passo ANTES de derrubar, para ver a peca chegando na
+  // posicao do braco.
+  passo_num++;
+  print_belt();
 
   // Cada braco derruba a peca do seu tamanho quando ela chega na sua posicao.
   // As checagens sao independentes: se duas pecas chegam juntas, os dois bracos
   // sao acionados na mesma parada.
-  if (esteira_mem[1] == PEQUENA) {
+  if (esteira_mem[POS_BRACO_P] == PEQUENA) {
     start_pulse(&pulse_outputs[PULSE_BRACO_P]);
-    esteira_mem[1] = VAZIO;
+    esteira_mem[POS_BRACO_P] = VAZIO;
   }
-  if (esteira_mem[2] == MEDIA) {
+  if (esteira_mem[POS_BRACO_M] == MEDIA) {
     start_pulse(&pulse_outputs[PULSE_BRACO_M]);
-    esteira_mem[2] = VAZIO;
+    esteira_mem[POS_BRACO_M] = VAZIO;
   }
-  if (esteira_mem[3] == GRANDE) {
+  if (esteira_mem[POS_BRACO_G] == GRANDE) {
     start_pulse(&pulse_outputs[PULSE_BRACO_G]);
-    esteira_mem[3] = VAZIO;
+    esteira_mem[POS_BRACO_G] = VAZIO;
   }
 }
 
 // Alterna a esteira entre andar um passo e ficar parada pelo tempo de um passo.
-// A cada transicao andar->parar avanca o registrador (on_belt_stop). Enquanto
-// parada, espelha o sensor na posicao de entrada (esteira_mem[0]).
+// A cada transicao andar->parar avanca o registrador (on_belt_stop), que le a
+// peca parada sobre o sensor pequeno e a coloca na posicao 1.
 void update_belt_step(void) {
   if (!belt_stepping) {
     return;
@@ -173,13 +243,9 @@ void update_belt_step(void) {
     gpio_set_level(MOTOR_ESTEIRA_PIN, belt_moving ? 1 : 0);
     belt_step_tick = xTaskGetTickCount();
     if (!belt_moving) {
-      // acabou de parar: avanca a memoria e aciona os bracos
+      // acabou de parar: avanca a memoria, imprime o vetor e aciona os bracos
       on_belt_stop();
     }
-  }
-  if (!belt_moving) {
-    // parada: registra na posicao 1 a peca que esta sob o sensor
-    esteira_mem[0] = classifica_sensor();
   }
 }
 
@@ -210,8 +276,7 @@ void poll_input(DebouncedInput *input) {
       input->candidate_level != input->last_level) {
     input->last_level = input->candidate_level;
     // Entradas com evento (botao) sinalizam ao supervisor na borda de subida.
-    // Os sensores de classificacao/fim de curso apenas mantem last_level, que e
-    // lido por classifica_sensor().
+    // As demais (metal/fim de curso) apenas mantem last_level para consulta.
     if (input->candidate_level == 1 && input->event != NULL) {
       trigger_event(input->event);
     }
@@ -245,6 +310,28 @@ void setup_gpio(void) {
       .pull_up_en = GPIO_PULLUP_DISABLE,
   };
   gpio_config(&input_conf);
+
+  // Sensores de classificacao pequeno e medio. O sensor grande esta quebrado, por
+  // isso nao e configurado/tratado por enquanto.
+  //  - pequeno: fica EXATAMENTE num ponto de parada; a peca para sobre ele. Basta
+  //             ler o NIVEL na parada (classifica_no_sensor), sem interrupcao.
+  //  - medio:   fica FORA de um ponto de parada; a peca so passa por ele andando,
+  //             entao precisa de interrupcao na borda de subida (sensor_medio_isr).
+  gpio_config_t sensor_conf = {
+      .intr_type = GPIO_INTR_DISABLE,
+      .mode = GPIO_MODE_INPUT,
+      .pin_bit_mask = (1ULL << SENSOR_PEQUENO_PIN) | (1ULL << SENSOR_MEDIO_PIN),
+      .pull_down_en = GPIO_PULLDOWN_ENABLE,
+      .pull_up_en = GPIO_PULLUP_DISABLE,
+  };
+  gpio_config(&sensor_conf);
+
+  // So o sensor medio usa interrupcao. Registra o handler primeiro e so entao
+  // habilita a borda de subida, para evitar a interrupcao espuria que ocorre
+  // quando a interrupcao ja esta habilitada antes do handler existir.
+  gpio_install_isr_service(0);
+  gpio_isr_handler_add(SENSOR_MEDIO_PIN, sensor_medio_isr, NULL);
+  gpio_set_intr_type(SENSOR_MEDIO_PIN, GPIO_INTR_POSEDGE);
 }
 
 void setup(void) {
